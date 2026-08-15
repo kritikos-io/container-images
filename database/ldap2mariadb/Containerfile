@@ -1,0 +1,16 @@
+ARG ALPINE=latest
+FROM alpine:${ALPINE}
+
+RUN apk add --no-cache \
+    bash \
+    openldap-clients \
+    mariadb-client \
+    ca-certificates \
+    && update-ca-certificates
+
+WORKDIR /workspace
+COPY --chmod=0755 sync-roles.sh        /workspace/sync-roles.sh
+COPY --chmod=0755 provision-user-db.sh /workspace/provision-user-db.sh
+
+ENTRYPOINT ["/bin/bash"]
+CMD ["sync-roles.sh"]

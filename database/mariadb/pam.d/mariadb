@@ -1,0 +1,6 @@
+# PAM service for MariaDB auth_pam logins (accounts created IDENTIFIED VIA pam
+# USING 'mariadb'). Authenticate + authorize against Active Directory through
+# the daemonless pam_ldap module; its connection settings live in
+# /etc/pam_ldap.conf, rendered at container start from the environment.
+auth     required   pam_ldap.so
+account  required   pam_ldap.so

@@ -1,0 +1,115 @@
+ARG PG_MAJOR=18
+ARG POSTGIS_MAJOR=3
+ARG VCHORD_VERSION=1.1.1
+
+FROM postgres:${PG_MAJOR:-18} AS base-image
+WORKDIR /tmp
+
+FROM base-image AS build-deps
+ARG PG_MAJOR
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  wget \
+  curl \
+  build-essential \
+  cmake \
+  libkrb5-dev \
+  libicu-dev \
+  postgresql-server-dev-$PG_MAJOR \
+  && apt-get install --reinstall -y ca-certificates \
+  && update-ca-certificates
+
+FROM build-deps AS downloads
+WORKDIR /tmp
+ARG PG_MAJOR
+ARG VCHORD_VERSION
+RUN wget https://github.com/tensorchord/VectorChord/releases/download/${VCHORD_VERSION}/postgresql-${PG_MAJOR}-vchord_${VCHORD_VERSION}-1_amd64.deb
+
+FROM downloads AS timescaledb
+ARG PG_MAJOR
+WORKDIR /tmp/timescaledb
+RUN URL_END=$(case "$PG_MAJOR" in ("12") echo "tag/2.11.2";; ("13") echo "tag/2.15.3";; (*) echo "latest";; esac) && \
+  ASSET_NAME=$(basename $(curl -LIs -o /dev/null -w %{url_effective} https://github.com/timescale/timescaledb/releases/${URL_END})) && \
+  curl --fail -L "https://github.com/timescale/timescaledb/archive/${ASSET_NAME}.tar.gz" | tar -zx --strip-components=1 -C . && ./bootstrap
+WORKDIR /tmp/timescaledb/build
+RUN make -j$(nproc) && \
+  make install
+
+FROM base-image AS final
+WORKDIR /tmp
+ARG PG_MAJOR
+ARG POSTGIS_MAJOR
+ARG VCHORD_VERSION
+
+## Install postgis, pg_hint_plan and pgvector
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+  libldap-common \
+  postgresql-${PG_MAJOR}-postgis-${POSTGIS_MAJOR} \
+  postgresql-${PG_MAJOR}-postgis-${POSTGIS_MAJOR}-scripts \
+  postgis \
+  postgresql-${PG_MAJOR}-pgrouting \
+  postgresql-${PG_MAJOR}-pg-hint-plan \
+  postgresql-${PG_MAJOR}-pgvector \
+  && apt-get install --reinstall -y ca-certificates
+
+## Copy TimescaleDB from build image
+COPY --from=timescaledb \
+  /usr/share/postgresql/$PG_MAJOR/extension/timescaledb* \
+  /usr/share/postgresql/$PG_MAJOR/extension/
+COPY --from=timescaledb \
+  /usr/lib/postgresql/$PG_MAJOR/lib/timescaledb* \
+  /usr/lib/postgresql/$PG_MAJOR/lib/
+
+## Install VectorChord
+COPY --from=downloads /tmp/postgresql-${PG_MAJOR}-vchord_${VCHORD_VERSION}-1_amd64.deb /tmp/
+RUN apt-get install -y --no-install-recommends ./postgresql-${PG_MAJOR}-vchord_${VCHORD_VERSION}-1_amd64.deb
+
+## Mark curated extensions as trusted so non-superusers with CREATE on their
+## database (e.g. app migration roles) can install them without superuser.
+## These ship untrusted, otherwise yielding "permission denied to create
+## extension". Safe because each only adds data types / index access methods /
+## planner hints -- no filesystem, network, raw-storage, or SECURITY DEFINER
+## access. Do NOT add postgis*, *_fdw, dblink, or storage-introspection modules.
+RUN set -eu; \
+  for ext in vector vchord pg_hint_plan; do \
+    ctl="/usr/share/postgresql/${PG_MAJOR}/extension/${ext}.control"; \
+    [ -f "$ctl" ] || { echo "trusted-marking: missing $ctl" >&2; exit 1; }; \
+    grep -qE '^[[:space:]]*trusted[[:space:]]*=' "$ctl" \
+      || printf 'trusted = true\n' >> "$ctl"; \
+  done
+
+## Layered configuration (applied to every newly initialized cluster).
+## initdb seeds postgresql.conf from postgresql.conf.sample, so appending
+## include_dir there pulls in our config regardless of the container command.
+##
+## Image-owned config lives under /usr/local/etc/postgresql (conf.d + pg_hba.conf);
+## /etc/postgresql holds ONLY the user override dirs (conf.d, hba.d) so that
+## path is a clean "mount your files here" area.
+##
+## postgresql.conf: our /usr/local/etc/postgresql/conf.d loaded first, user
+##   /etc/postgresql/conf.d last (last-wins => users override us, but a stray
+##   mount can't wipe our defaults e.g. shared_preload_libraries).
+##
+## pg_hba.conf: conf.d/20-hba.conf points hba_file at our authoritative
+##   /usr/local/etc/postgresql/pg_hba.conf, which fully replaces the initdb-
+##   generated file (and sidesteps the entrypoint's appended "host all all all
+##   <method>" line, written to the now-unused PGDATA copy). Tier order in that
+##   file: local allows -> include_dir /etc/postgresql/hba.d -> default-deny.
+COPY conf.d/ /usr/local/etc/postgresql/conf.d/
+COPY pg_hba.conf /usr/local/etc/postgresql/pg_hba.conf
+RUN mkdir -p /etc/postgresql/conf.d \
+  /etc/postgresql/hba.d \
+  && { \
+  echo "include_dir = '/usr/local/etc/postgresql/conf.d'"; \
+  echo "include_dir = '/etc/postgresql/conf.d'"; \
+  } >> /usr/share/postgresql/${PG_MAJOR}/postgresql.conf.sample
+
+## Clean image
+RUN rm -rf /var/lib/apt/lists/* \
+  && rm -rf /tmp/*
+
+## Report health via pg_isready (env vars expand at runtime via /bin/sh -c).
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=2s \
+  CMD pg_isready --dbname="${POSTGRES_DB:-postgres}" --username="${POSTGRES_USER:-postgres}" || exit 1
+
+WORKDIR /var/lib/postgresql/data

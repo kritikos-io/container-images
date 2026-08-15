@@ -1,0 +1,50 @@
+name: image-builder
+
+services:
+  postgres:
+    image: containers.kritikos.io/system/postgres-extended:${PG_MAJOR:-18}
+    build:
+      context: postgres
+      dockerfile: Containerfile
+      args:
+        - PG_MAJOR=${PG_MAJOR:-18}
+        - POSTGIS_MAJOR=${POSTGIS_MAJOR:-3}
+        - VCHORD_VERSION=${VCHORD_VERSION:-1.1.1}
+
+  ldap2pg:
+    image: containers.kritikos.io/system/ldap2pg:${LDAP2PG_VERSION:-6.6.0}
+    build:
+      context: ldap2pg
+      dockerfile: Containerfile
+      args:
+        - ALPINE=${ALPINE_VERSION:-latest}
+        - GO_VERSION=${GO_VERSION:-1.26.3}
+        - LDAP2PG_VERSION=${LDAP2PG_VERSION:-6.6.0}
+
+  pgpool:
+    container_name: pgpool
+    image: containers.kritikos.io/system/pgpool:${PGPOOL_VERSION:-4.7.2}
+    build:
+      context: pgpool
+      dockerfile: Containerfile
+      args:
+        - ALPINE=${ALPINE_VERSION:-latest}
+        - PG_MAJOR=${PG_MAJOR:-18}
+        - PGPOOL_VERSION=${PGPOOL_VERSION:-4.7.2}
+
+  mariadb:
+    image: containers.kritikos.io/system/mariadb-extended:${MARIADB_VERSION:-12}
+    build:
+      context: mariadb
+      dockerfile: Containerfile
+      args:
+        - MARIADB_VERSION=${MARIADB_VERSION:-12}
+
+  ldap2mariadb:
+    container_name: ldap2mariadb
+    image: containers.kritikos.io/system/ldap2mariadb:latest
+    build:
+      context: ldap2mariadb
+      dockerfile: Containerfile
+      args:
+        - ALPINE=${ALPINE_VERSION:-latest}

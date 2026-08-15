@@ -1,0 +1,11 @@
+# Image-owned plugin preload (analogue of the postgres image's
+# shared_preload_libraries in 10-extensions.conf). auth_pam provides Active
+# Directory logins via PAM -> pam_ldap.
+[mariadb]
+plugin_load_add = auth_pam
+
+# Make auth_pam use the mysql_clear_password protocol instead of the interactive
+# "dialog" one. Required for MaxScale: its clear_pw_passthrough only speaks
+# mysql_native_password / mysql_clear_password to backends, never dialog. The
+# password is sent in cleartext, so TLS must be on (99-tls.cnf) — it is.
+pam_use_cleartext_plugin = 1

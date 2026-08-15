@@ -1,0 +1,79 @@
+ARG ALPINE=latest
+ARG PG_MAJOR=18
+ARG PGPOOL_VERSION=4.7.2
+
+FROM alpine:${ALPINE} AS base
+
+FROM base AS builder
+ARG PG_MAJOR
+ARG PGPOOL_VERSION
+
+RUN apk add --no-cache \
+    build-base \
+    linux-headers \
+    postgresql${PG_MAJOR}-dev \
+    openssl-dev \
+    openldap-dev \
+    libmemcached-dev \
+    wget
+
+WORKDIR /tmp
+
+RUN wget -qO- https://www.pgpool.net/source/pgpool-II-${PGPOOL_VERSION}.tar.gz | tar xz
+
+WORKDIR /tmp/pgpool-II-${PGPOOL_VERSION}
+RUN ./configure \
+    --prefix=/usr \
+    --sysconfdir=/etc/pgpool-II \
+    --with-openssl \
+    --with-ldap \
+    --with-memcached=/usr \
+    && make -j"$(nproc)" \
+    && make install DESTDIR=/build
+
+WORKDIR /tmp/pgpool-II-${PGPOOL_VERSION}/src/sql
+RUN make -j"$(nproc)" && make install DESTDIR=/build
+
+# ── Runtime stage ──────────────────────────────────────────────────────────
+FROM base
+ARG PG_MAJOR
+
+RUN apk add --no-cache \
+    bash \
+    postgresql${PG_MAJOR}-client \
+    libldap \
+    openssl \
+    libmemcached-libs \
+    ca-certificates \
+    && update-ca-certificates
+
+# Copy built binaries, libs and default configs
+COPY --from=builder /build/usr/ /usr/
+COPY --from=builder /build/etc/ /etc/
+
+# Runtime directories
+RUN mkdir -p /var/run/pgpool /var/log/pgpool /etc/pgpool-II \
+    && adduser -D -h /var/run/pgpool pgpool \
+    && chown pgpool:pgpool /var/run/pgpool /var/log/pgpool
+
+# Ship a minimal default config (overridden by bind-mount at runtime)
+RUN set -eu; \
+    cp /etc/pgpool-II/pgpool.conf.sample   /etc/pgpool-II/pgpool.conf; \
+    cp /etc/pgpool-II/pool_hba.conf.sample /etc/pgpool-II/pool_hba.conf; \
+    cp /etc/pgpool-II/pcp.conf.sample      /etc/pgpool-II/pcp.conf
+
+EXPOSE 9999 9898
+
+# Green means pgpool can hand a client a backend connection, i.e. at least one
+# node is attached AND a primary is identifiable -- NOT that the cluster is
+# intact: a degenerated standby still reports healthy. Retries exist to ride out
+# the ~1 health_check_period window where failover makes connections fail.
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
+  CMD pg_isready -h 127.0.0.1 -p 9999 || exit 1
+
+# AES passwords in pool_passwd: mount the key anywhere and set PGPOOLKEYFILE to
+# it; the entrypoint re-stages it at the permissions pgpool insists on.
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["pgpool", "-n", "-f", "/etc/pgpool-II/pgpool.conf", "-F", "/etc/pgpool-II/pcp.conf"]

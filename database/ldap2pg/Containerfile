@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.7
+
+ARG ALPINE=latest
+ARG GO_VERSION=1.26.3
+ARG LDAP2PG_VERSION=6.6.0
+
+# ─── Build stage ───────────────────────────────────────────────────────
+# ldap2pg 6.6.0 introduced strict YAML decoding but left the `joins`
+# subsearch key half-renamed: the normalizer rewrites it to `subsearches`
+# while the mapstructure tag on the target struct still says `joins`, so
+# any config using the (documented) `joins:` key is rejected as
+# "invalid keys: subsearches".
+#
+# The bug lives in a single struct tag; we grab the upstream source
+# tarball for the pinned tag, patch that one line, and rebuild.
+# Remove the whole builder stage and switch back to the released
+# .apk once upstream ships the fix.
+FROM golang:${GO_VERSION}-alpine AS builder
+ARG LDAP2PG_VERSION
+
+RUN apk add --no-cache curl tar
+
+WORKDIR /src
+RUN curl -fsSL "https://github.com/dalibo/ldap2pg/archive/refs/tags/v${LDAP2PG_VERSION}.tar.gz" \
+    | tar -xz --strip-components=1
+
+# Re-align the struct tag with the normalizer's canonical key name.
+RUN grep -q 'mapstructure:"joins"' internal/ldap/search.go \
+    && sed -i 's|mapstructure:"joins"|mapstructure:"subsearches"|' internal/ldap/search.go
+
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X github.com/dalibo/ldap2pg/v6/internal/cmd.Version=${LDAP2PG_VERSION}" \
+    -o /out/ldap2pg .
+
+# ─── Runtime stage ─────────────────────────────────────────────────────
+FROM alpine:${ALPINE}
+
+ARG LDAP2PG_VERSION
+
+ENV LANG=en_US.utf8
+
+WORKDIR /workspace
+
+RUN mkdir -p /docker-entrypoint.d \
+    && apk add --no-cache \
+    bash \
+    ca-certificates \
+    openldap-clients \
+    postgresql-client \
+    && update-ca-certificates
+
+COPY --from=builder /out/ldap2pg /usr/bin/ldap2pg
+
+# Fetch the upstream docker entrypoint pinned to the same release tag.
+ADD --chmod=0755 https://raw.githubusercontent.com/dalibo/ldap2pg/v${LDAP2PG_VERSION}/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+COPY --chmod=0755 provision-user-db.sh /workspace/provision-user-db.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+RUN /usr/local/bin/docker-entrypoint.sh --version
