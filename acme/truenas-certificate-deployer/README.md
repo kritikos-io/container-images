@@ -17,7 +17,7 @@ certificate's PEM or private key in place, so each renewal receives a new ID.
 2. If no matching record exists, import one with a temporary name ending in
    `_pending_<16-character full-chain hash>`.
 3. Select its ID for the UI and request a UI restart when needed. Connect directly
-   to HTTPS and require an exact match against the expected leaf certificate.
+   to HTTPS and require an exact match against the expected leaf certifi4scate.
 4. Confirm the selected UI certificate ID, then delete superseded managed records
    using non-forced deletion jobs. TrueNAS checks service dependencies and refuses
    deletion of certificates still referenced by services.

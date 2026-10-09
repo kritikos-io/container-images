@@ -1,54 +1,72 @@
-# syntax=docker/dockerfile:1.7
-ARG MARIADB_VERSION=latest
+ARG MARIADB_VERSION=13.0.2
+FROM mariadb:${MARIADB_VERSION} AS base
 
-FROM mariadb:${MARIADB_VERSION}
+FROM base AS pam-build
 
-# ── AD/LDAP authentication via PAM ──────────────────────────────────────────
-# MariaDB Community has no native LDAP auth plugin, so AD logins go through the
-# auth_pam plugin -> a PAM "mariadb" service -> daemonless pam_ldap doing an
-# LDAP search+bind against Active Directory. This is the analogue of the pgpool
-# `ldap` method in pool_hba.conf; deliberately NO SSSD/nslcd daemon is added.
-#
-# libpam-ldap is the daemonless PAM/LDAP module. The auth_pam plugin ships with
-# recent MariaDB; the separate plugin package (older layouts) is installed
-# best-effort and also fixes the setuid auth_pam_tool helper permissions.
-# Either source must leave auth_pam.so in place: 10-plugins.cnf loads it
-# unconditionally, so a missing .so would only surface as a server that refuses
-# to start.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl libcrypt-dev libldap-dev libpam0g-dev libsasl2-dev perl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build/pam_ldap
+RUN curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+      https://codeload.github.com/PADL/pam_ldap/tar.gz/656448f091cbeb9efb3ece08e6868e40b8e7b6f8 \
+      --output /tmp/pam_ldap.tar.gz \
+    && printf '%s  %s\n' \
+      1aa622e85621b9018025e3483956d854566a5bc0636a4e8d9d005093f02dd16b \
+      /tmp/pam_ldap.tar.gz | sha256sum -c - \
+    && tar -xzf /tmp/pam_ldap.tar.gz --strip-components=1 \
+    && CFLAGS='-O2 -fPIC -std=gnu89' ./configure \
+      --prefix=/usr/local \
+      --with-ldap-lib=openldap \
+      --with-ldap-conf-file=/etc/pam_ldap.conf \
+      --enable-ssl \
+    && PERL5LIB=/build/pam_ldap make -j2 \
+    && nm -D pam_ldap.so | grep -E ' T pam_sm_authenticate(@|$)' \
+    && nm -D pam_ldap.so | grep -E ' T pam_sm_acct_mgmt(@|$)' \
+    && grep -F '#define HAVE_LDAP_INITIALIZE 1' config.h \
+    && grep -F '#define HAVE_LDAP_START_TLS_S 1' config.h
+
+FROM base
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates libcrypt1 libldap2 libpam0g util-linux \
+    && command -v setpriv \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=pam-build --chmod=0755 /build/pam_ldap/pam_ldap.so /usr/local/lib/security/pam_ldap_direct.so
+COPY --from=pam-build /build/pam_ldap/COPYING /build/pam_ldap/COPYING.LIB /usr/share/doc/pam-ldap-direct/
+
 RUN set -eu; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      libpam-ldap \
-      ca-certificates \
-      gettext-base; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      mariadb-plugin-auth-pam || true; \
-    rm -rf /var/lib/apt/lists/*; \
+    module=/usr/local/lib/security/pam_ldap_direct.so; \
+    ldd "$module" > /tmp/pam-ldap-dependencies; \
+    if grep -q 'not found' /tmp/pam-ldap-dependencies; then \
+      cat /tmp/pam-ldap-dependencies >&2; \
+      exit 1; \
+    fi; \
+    grep -F 'libldap' /tmp/pam-ldap-dependencies; \
+    rm /tmp/pam-ldap-dependencies; \
     plugin=/usr/lib/mysql/plugin/auth_pam.so; \
-    [ -e "$plugin" ] || { echo "auth_pam: missing $plugin" >&2; exit 1; }
+    helper_dir=/usr/lib/mysql/plugin/auth_pam_tool_dir; \
+    helper="$helper_dir/auth_pam_tool"; \
+    test -f "$plugin" || { echo "Missing MariaDB auth_pam plugin: $plugin" >&2; exit 1; }; \
+    test -f "$helper" || { echo "Missing MariaDB PAM helper: $helper" >&2; exit 1; }; \
+    chown root:mysql "$helper_dir" "$helper"; \
+    chmod 0750 "$helper_dir"; \
+    chmod 4750 "$helper"; \
+    gosu mysql test -x "$helper"
 
-# ── Layered configuration ───────────────────────────────────────────────────
-# Mirror the postgres image: image-owned defaults load first, user overrides
-# last (last-wins). The stock image already reads /etc/mysql/conf.d and
-# /etc/mysql/mariadb.conf.d; we append two include dirs AFTER those so:
-#   image.conf.d -> our defaults (override the base image's 50-server.cnf)
-#   site.conf.d  -> a clean "mount your *.cnf here" area (wins over everything)
-RUN set -eu; \
-    mkdir -p /etc/mysql/image.conf.d /etc/mysql/site.conf.d; \
-    { \
-      echo '!includedir /etc/mysql/image.conf.d/'; \
-      echo '!includedir /etc/mysql/site.conf.d/'; \
-    } >> /etc/mysql/mariadb.cnf
+RUN mkdir -p /etc/mysql/image.conf.d /etc/mysql/site.conf.d \
+    && printf '%s\n' \
+      '!includedir /etc/mysql/image.conf.d/' \
+      '!includedir /etc/mysql/site.conf.d/' >> /etc/mysql/mariadb.cnf
+
 COPY conf.d/ /etc/mysql/image.conf.d/
-
-# PAM service definition for MariaDB logins (auth_pam calls service "mariadb").
-COPY pam.d/mariadb /etc/pam.d/mariadb
-
-# Entrypoint wrapper: renders /etc/pam_ldap.conf from env (keeps the AD bind
-# secret out of the image), then hands off to the stock mariadb entrypoint.
+COPY --chmod=0644 pam.d/mariadb /etc/pam.d/mariadb
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/ldap-entrypoint.sh
 
-# Report health via the image's bundled healthcheck helper.
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=15s \
   CMD healthcheck.sh --connect --innodb_initialized || exit 1
 

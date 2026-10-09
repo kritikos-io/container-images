@@ -54,8 +54,6 @@ COPY --from=builder /out/ldap2pg /usr/bin/ldap2pg
 # Fetch the upstream docker entrypoint pinned to the same release tag.
 ADD --chmod=0755 https://raw.githubusercontent.com/dalibo/ldap2pg/v${LDAP2PG_VERSION}/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-COPY --chmod=0755 provision-user-db.sh /workspace/provision-user-db.sh
-
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 RUN /usr/local/bin/docker-entrypoint.sh --version

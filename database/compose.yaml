@@ -33,12 +33,12 @@ services:
         - PGPOOL_VERSION=${PGPOOL_VERSION:-4.7.2}
 
   mariadb:
-    image: containers.kritikos.io/system/mariadb-extended:${MARIADB_VERSION:-12}
+    image: containers.kritikos.io/system/mariadb-extended:${MARIADB_VERSION:-13.0.2}
     build:
       context: mariadb
       dockerfile: Containerfile
       args:
-        - MARIADB_VERSION=${MARIADB_VERSION:-12}
+        - MARIADB_VERSION=${MARIADB_VERSION:-13.0.2}
 
   ldap2mariadb:
     container_name: ldap2mariadb
