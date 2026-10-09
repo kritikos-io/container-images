@@ -1,0 +1,29 @@
+name: image-builder-acme
+
+services:
+  truenas-certificate-deployer:
+    container_name: truenas-certificate-deployer
+    image: containers.kritikos.io/system/truenas-certificate-deployer:latest
+    build:
+      context: truenas-certificate-deployer
+      dockerfile: Containerfile
+      provenance: mode=max
+      sbom: true
+      args:
+        IMAGE_VERSION: ${IMAGE_VERSION:-0.0.0-dev}
+        IMAGE_REVISION: ${IMAGE_REVISION:-}
+        IMAGE_CREATED: ${IMAGE_CREATED:-}
+    restart: unless-stopped
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TRUENAS_URI: ws://localhost/api/current
+      TRUENAS_UI_RESTART: "true"
+    cap_drop:
+      - ALL
+    network_mode: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=8M

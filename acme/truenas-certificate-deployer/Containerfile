@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+ARG ALPINE_VERSION=3.20
+FROM alpine:${ALPINE_VERSION}
+
+# Build metadata (pass via --build-arg at build time)
+ARG IMAGE_VERSION=1.0.0
+ARG ALPINE_VERSION IMAGE_REVISION IMAGE_CREATED
+
+# OCI image annotations (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+LABEL org.opencontainers.image.title="TrueNAS Certificate Deployer" \
+  org.opencontainers.image.description="Sidecar for acme.sh that deploys renewed certificates to TrueNAS via the websocket API" \
+  org.opencontainers.image.vendor="kritikos.io" \
+  org.opencontainers.image.authors="Alexandros Kritikos" \
+  org.opencontainers.image.url="https://containers.kritikos.io/system/truenas-certificate-deployer" \
+  org.opencontainers.image.documentation="https://containers.kritikos.io/system/truenas-certificate-deployer" \
+  org.opencontainers.image.source="https://containers.kritikos.io/system/truenas-certificate-deployer" \
+  org.opencontainers.image.licenses="MIT" \
+  org.opencontainers.image.base.name="docker.io/library/alpine:${ALPINE_VERSION}" \
+  org.opencontainers.image.version="${IMAGE_VERSION}" \
+  org.opencontainers.image.revision="${IMAGE_REVISION}" \
+  org.opencontainers.image.created="${IMAGE_CREATED}"
+
+RUN apk add --no-cache \
+  python3 \
+  py3-pip \
+  py3-websocket-client \
+  inotify-tools \
+  tini \
+  && addgroup -g 12002 tls \
+  && adduser -D -H -u 65534 -G tls -s /sbin/nologin deployer 2>/dev/null || true
+
+COPY deploy.py /usr/local/bin/deploy.py
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/deploy.py /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
