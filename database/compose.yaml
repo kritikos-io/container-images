@@ -1,4 +1,4 @@
-name: image-builder
+name: image-builder-database
 
 services:
   postgres:
