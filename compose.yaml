@@ -1,3 +1,4 @@
 include:
   - database/compose.yaml
   - acme/compose.yaml
+  - rustfs/compose.yaml

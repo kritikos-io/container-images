@@ -1,0 +1,170 @@
+ARG RUST_BUILDER_IMAGE
+ARG RUSTFS_BASE_IMAGE
+ARG NODE_BUILDER_IMAGE
+
+FROM ${NODE_BUILDER_IMAGE} AS console-build
+
+SHELL ["/bin/bash", "-e", "-u", "-o", "pipefail", "-c"]
+
+ARG PNPM_VERSION
+ARG RUSTFS_CONSOLE_VERSION
+ARG RUSTFS_CONSOLE_SOURCE_COMMIT
+ARG RUSTFS_CONSOLE_SCOPED_PATCH_SHA256
+
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN npm install --global "pnpm@${PNPM_VERSION}"
+
+RUN git -c advice.detachedHead=false clone --branch "${RUSTFS_CONSOLE_VERSION}" --depth 1 \
+      https://github.com/rustfs/console.git /console && \
+    test "$(git -C /console rev-parse HEAD)" = "${RUSTFS_CONSOLE_SOURCE_COMMIT}"
+
+WORKDIR /console
+
+COPY console-scoped-permissions.patch /tmp/console-scoped-permissions.patch
+
+RUN printf '%s  %s\n' "${RUSTFS_CONSOLE_SCOPED_PATCH_SHA256}" /tmp/console-scoped-permissions.patch | sha256sum -c - && \
+    git apply --check /tmp/console-scoped-permissions.patch && \
+    git apply /tmp/console-scoped-permissions.patch && \
+    git diff --check
+
+RUN --mount=type=cache,id=rustfs-console-pnpm,target=/pnpm/store,sharing=locked \
+    pnpm install --frozen-lockfile --ignore-scripts --store-dir /pnpm/store
+
+RUN node --experimental-strip-types --import ./scripts/register-typescript-loader.mjs --test \
+      tests/hooks/use-permissions-refresh.test.ts \
+      tests/hooks/use-permissions.test.ts \
+      tests/hooks/use-bucket-quota.test.ts \
+      tests/lib/api-client.test.ts \
+      tests/lib/bucket-policy-status.test.ts \
+      tests/lib/bucket-settings-safety.test.js \
+      tests/lib/scoped-bucket-capabilities.test.ts \
+      tests/lib/scoped-bucket-form.test.ts \
+      tests/lib/console-policy-parser.test.ts \
+      tests/lib/force-cleanup-permissions.test.ts \
+      tests/lib/object-transfer.test.ts \
+      tests/lib/object-lock-permissions.test.ts && \
+    pnpm build && \
+    test -s out/index.html && \
+    test -s out/rustfs/console/index.html
+
+FROM ${RUST_BUILDER_IMAGE} AS build
+
+SHELL ["/bin/bash", "-e", "-u", "-o", "pipefail", "-c"]
+
+ARG TARGETARCH
+ARG RUST_TOOLCHAIN
+ARG RUSTFS_VERSION
+ARG RUSTFS_IMAGE_TAG
+ARG RUSTFS_SOURCE_COMMIT
+ARG RUSTFS_PATCH_SHA256
+ARG RUSTFS_CORS_PATCH_SHA256
+ARG PROTOC_URL
+ARG PROTOC_SHA256
+ARG FLATC_URL
+ARG FLATC_SHA256
+ARG RUSTFS_BUILD_JOBS
+
+ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN} \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=/build/target \
+    CARGO_BUILD_JOBS=${RUSTFS_BUILD_JOBS} \
+    RUSTFS_BUILD_VERSION=${RUSTFS_IMAGE_TAG}
+
+RUN test "${TARGETARCH}" = amd64 || { printf '%s\n' 'This recipe requires linux/amd64.' >&2; exit 1; }
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      binutils build-essential ca-certificates clang cmake curl git libclang-dev \
+      libssl-dev musl-tools ninja-build perl pkg-config unzip && \
+    apt-get clean && \
+    rustup target add --toolchain "${RUST_TOOLCHAIN}" x86_64-unknown-linux-musl
+
+RUN curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --retry 3 --connect-timeout 30 --max-time 300 "${PROTOC_URL}" -o /tmp/protoc.zip && \
+    printf '%s  %s\n' "${PROTOC_SHA256}" /tmp/protoc.zip | sha256sum -c - && \
+    unzip -q /tmp/protoc.zip -d /tmp/protoc && \
+    install -m 0755 /tmp/protoc/bin/protoc /usr/local/bin/protoc && \
+    mkdir -p /usr/local/include && \
+    cp -R /tmp/protoc/include/. /usr/local/include/ && \
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --retry 3 --connect-timeout 30 --max-time 300 "${FLATC_URL}" -o /tmp/flatc.zip && \
+    printf '%s  %s\n' "${FLATC_SHA256}" /tmp/flatc.zip | sha256sum -c - && \
+    unzip -q /tmp/flatc.zip -d /tmp/flatc && \
+    install -m 0755 /tmp/flatc/flatc /usr/local/bin/flatc && \
+    protoc --version && \
+    flatc --version
+
+RUN git -c advice.detachedHead=false clone --branch "${RUSTFS_VERSION}" --depth 1 \
+      https://github.com/rustfs/rustfs.git /src && \
+    test "$(git -C /src rev-parse HEAD)" = "${RUSTFS_SOURCE_COMMIT}"
+
+WORKDIR /src
+
+COPY policy-variables.patch /tmp/policy-variables.patch
+
+RUN printf '%s  %s\n' "${RUSTFS_PATCH_SHA256}" /tmp/policy-variables.patch | sha256sum -c - && \
+    git apply --check /tmp/policy-variables.patch && \
+    git apply /tmp/policy-variables.patch && \
+    git diff --check
+
+COPY virtual-hosted-cors.patch /tmp/virtual-hosted-cors.patch
+
+RUN printf '%s  %s\n' "${RUSTFS_CORS_PATCH_SHA256}" /tmp/virtual-hosted-cors.patch | sha256sum -c - && \
+    git apply --check /tmp/virtual-hosted-cors.patch && \
+    git apply /tmp/virtual-hosted-cors.patch && \
+    git diff --check
+
+COPY --from=console-build /console/out/ rustfs/static/
+
+RUN test -s rustfs/static/index.html
+
+RUN --mount=type=cache,id=rustfs-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rustfs-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rustfs-amd64-target,target=/build/target,sharing=locked \
+    cargo test --locked --package rustfs-policy --lib --target x86_64-unknown-linux-musl && \
+    cargo test --locked --package rustfs --lib --target x86_64-unknown-linux-musl server:: && \
+    cargo build --locked --release --package rustfs --bin rustfs --target x86_64-unknown-linux-musl && \
+    install -D -m 0755 /build/target/x86_64-unknown-linux-musl/release/rustfs /out/rustfs && \
+    readelf -l /out/rustfs > /tmp/rustfs-program-headers && \
+    if grep -q INTERP /tmp/rustfs-program-headers; then \
+      printf '%s\n' 'The runtime binary must not require a dynamic ELF interpreter.' >&2; \
+      exit 1; \
+    fi
+
+FROM ${RUSTFS_BASE_IMAGE}
+
+ARG RUSTFS_BASE_IMAGE
+ARG RUSTFS_VERSION
+ARG RUSTFS_IMAGE_TAG
+ARG RUSTFS_SOURCE_COMMIT
+ARG RUSTFS_PATCH_SHA256
+ARG RUSTFS_CORS_PATCH_SHA256
+ARG RUSTFS_CONSOLE_VERSION
+ARG RUSTFS_CONSOLE_SOURCE_COMMIT
+ARG RUSTFS_CONSOLE_SCOPED_PATCH_SHA256
+
+LABEL org.opencontainers.image.title="RustFS policy, console and CORS fixes" \
+      org.opencontainers.image.description="RustFS 1.0.4 with policy-variable substitution, Console v0.1.38, scoped permissions, non-admin bucket-settings fixes and upstream virtual-hosted bucket CORS" \
+      org.opencontainers.image.version="${RUSTFS_IMAGE_TAG}" \
+      org.opencontainers.image.revision="${RUSTFS_SOURCE_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/rustfs/rustfs" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="${RUSTFS_BASE_IMAGE}" \
+      io.kritikos.rustfs.upstream-version="${RUSTFS_VERSION}" \
+      io.kritikos.rustfs.upstream-fix="4e48c390e792859a250da60d7de9909df2d188f4" \
+      io.kritikos.rustfs.patch-sha256="${RUSTFS_PATCH_SHA256}" \
+      io.kritikos.rustfs.cors-upstream-fix="d229c79e38d128a29accad5deebfb13cdec11475" \
+      io.kritikos.rustfs.cors-patch-sha256="${RUSTFS_CORS_PATCH_SHA256}" \
+      io.kritikos.rustfs.console-version="${RUSTFS_CONSOLE_VERSION}" \
+      io.kritikos.rustfs.console-source-commit="${RUSTFS_CONSOLE_SOURCE_COMMIT}" \
+      io.kritikos.rustfs.console-scoped-patch-sha256="${RUSTFS_CONSOLE_SCOPED_PATCH_SHA256}" \
+      version="${RUSTFS_IMAGE_TAG}" \
+      release="${RUSTFS_IMAGE_TAG}" \
+      vcs-ref="${RUSTFS_SOURCE_COMMIT}"
+
+COPY --from=build /out/rustfs /usr/bin/rustfs
+COPY --from=build /src/LICENSE /usr/share/licenses/rustfs/LICENSE
+COPY --from=console-build /console/LICENSE /usr/share/licenses/rustfs-console/LICENSE
+
+RUN ["/usr/bin/rustfs", "--version"]

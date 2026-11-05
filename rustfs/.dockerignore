@@ -1,0 +1,5 @@
+*
+!Containerfile
+!policy-variables.patch
+!virtual-hosted-cors.patch
+!console-scoped-permissions.patch

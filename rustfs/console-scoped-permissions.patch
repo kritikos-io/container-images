@@ -1,0 +1,746 @@
+diff --git a/components/buckets/new-form.tsx b/components/buckets/new-form.tsx
+index ce606c1..0017f68 100644
+--- a/components/buckets/new-form.tsx
++++ b/components/buckets/new-form.tsx
+@@ -61,8 +61,9 @@ export function BucketNewForm({ show, onShowChange }: BucketNewFormProps) {
+   const nameError = getOptionalBucketNameError(objectKey)
+   const parsedRetentionPeriod = Math.max(1, Number.parseInt(retentionPeriod, 10) || 1)
+   const isSubmitDisabled = creating || !trimmedBucketName || !!nameError
+-  const canCreateBucket = canCapability("bucket.create")
+   const bucketContext = trimmedBucketName ? { bucket: trimmedBucketName } : {}
++  const canCreateBucket = !!trimmedBucketName && canCapability("bucket.create", bucketContext)
++  const permissionError = trimmedBucketName && !nameError && !canCreateBucket ? t("Access Denied") : undefined
+   const canEditVersioning = canCapability("bucket.versioning.edit", bucketContext)
+   const canEditObjectLock = canCapability("bucket.objectLock.edit", bucketContext)
+   const canEditQuota = canCapability("bucket.quota.edit", bucketContext)
+@@ -86,7 +87,11 @@ export function BucketNewForm({ show, onShowChange }: BucketNewFormProps) {
+   }
+ 
+   const handleCreateBucket = async () => {
+-    if (!canCreateBucket || isSubmitDisabled) return
++    if (!canCreateBucket) {
++      message.error(t("Access Denied"))
++      return
++    }
++    if (isSubmitDisabled) return
+     if (nameError) {
+       message.error(t(nameError))
+       return
+@@ -167,11 +172,14 @@ export function BucketNewForm({ show, onShowChange }: BucketNewFormProps) {
+                   value={objectKey}
+                   onChange={(e) => setObjectKey(e.target.value)}
+                   autoComplete="off"
+-                  className={cn("w-full", nameError && "border-destructive focus-visible:ring-destructive")}
+-                  aria-invalid={Boolean(nameError)}
++                  className={cn(
++                    "w-full",
++                    (nameError || permissionError) && "border-destructive focus-visible:ring-destructive",
++                  )}
++                  aria-invalid={Boolean(nameError || permissionError)}
+                 />
+               </FieldContent>
+-              <FieldError>{nameError ? t(nameError) : undefined}</FieldError>
++              <FieldError>{nameError ? t(nameError) : permissionError}</FieldError>
+             </Field>
+           </DialogSection>
+           <DialogSection title={t("Security")}>
+diff --git a/hooks/use-bucket.ts b/hooks/use-bucket.ts
+index f118649..5ea8351 100644
+--- a/hooks/use-bucket.ts
++++ b/hooks/use-bucket.ts
+@@ -395,7 +395,10 @@ export function useBucket() {
+     [client],
+   )
+ 
+-  const getBucketQuota = useCallback(async (bucket: string) => api.get(`/quota/${bucket}`), [api])
++  const getBucketQuota = useCallback(
++    async (bucket: string) => api.get(`/quota/${bucket}`, { suppress403Redirect: true }),
++    [api],
++  )
+   const putBucketQuota = useCallback(
+     async (bucket: string, quota: unknown) => api.put(`/quota/${bucket}`, quota),
+     [api],
+diff --git a/hooks/use-permissions.tsx b/hooks/use-permissions.tsx
+index 44d1cdb..9f0627b 100644
+--- a/hooks/use-permissions.tsx
++++ b/hooks/use-permissions.tsx
+@@ -1,7 +1,7 @@
+ "use client"
+ 
+ import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from "react"
+-import { hasConsoleScopes, type ConsolePolicy } from "@/lib/console-policy-parser"
++import { hasConsoleScopes, resolveConsolePolicyUsername, type ConsolePolicy } from "@/lib/console-policy-parser"
+ import { hasConsoleCapability, isForceCleanupTarget, type ConsoleCapability } from "@/lib/permission-capabilities"
+ import type { PermissionResourceContext } from "@/lib/permission-resources"
+ import { CONSOLE_SCOPES, PAGE_PERMISSIONS } from "@/lib/console-permissions"
+@@ -95,7 +95,7 @@ export function PermissionsProvider({ children }: { children: React.ReactNode })
+       setUserInfo(info)
+       const policyStr = info?.policy as string
+       if (policyStr) {
+-        setUserPolicy(JSON.parse(policyStr) as ConsolePolicy)
++        setUserPolicy(resolveConsolePolicyUsername(JSON.parse(policyStr) as ConsolePolicy, info.username))
+       } else {
+         setUserPolicy(null)
+       }
+diff --git a/lib/console-policy-parser.ts b/lib/console-policy-parser.ts
+index 3ce9da0..ad09527 100644
+--- a/lib/console-policy-parser.ts
++++ b/lib/console-policy-parser.ts
+@@ -14,6 +14,20 @@ export interface ConsolePolicy {
+   Statement: ConsoleStatement[]
+ }
+ 
++export function resolveConsolePolicyUsername(policy: ConsolePolicy, username: unknown): ConsolePolicy {
++  if (typeof username !== "string" || !username.trim() || /[*?]|\$\{/.test(username)) return policy
++
++  const resolveResource = (resource: string) => resource.replaceAll("${jwt:preferred_username}", () => username)
++  return {
++    ...policy,
++    Statement: policy.Statement.map((statement) => ({
++      ...statement,
++      ...(statement.Resource && { Resource: statement.Resource.map(resolveResource) }),
++      ...(statement.NotResource && { NotResource: statement.NotResource.map(resolveResource) }),
++    })),
++  }
++}
++
+ /**
+  * Check if an action matches the policy actions
+  * RustFS policy parser treats bare "*" as S3 wildcard only, not a cross-service wildcard.
+@@ -23,6 +37,9 @@ export interface ConsolePolicy {
+  */
+ const ACTION_ALIASES: Record<string, string> = {
+   "*": "s3:*",
++  "s3:GetBucketCORS": "s3:GetBucketCors",
++  "s3:PutBucketCORS": "s3:PutBucketCors",
++  "s3:DeleteBucketCORS": "s3:DeleteBucketCors",
+   "s3:GetLifecycleConfiguration": "s3:GetBucketLifecycle",
+   "s3:GetBucketLifecycleConfiguration": "s3:GetBucketLifecycle",
+   "s3:PutLifecycleConfiguration": "s3:PutBucketLifecycle",
+diff --git a/lib/permission-capabilities.ts b/lib/permission-capabilities.ts
+index 6bb1ec2..487f249 100644
+--- a/lib/permission-capabilities.ts
++++ b/lib/permission-capabilities.ts
+@@ -56,7 +56,7 @@ export type ConsoleCapability =
+   | "policies.edit"
+   | "policies.delete"
+ 
+-type ResourceTarget = "none" | "bucket" | "object" | "exactObject" | "objectPattern" | "allBuckets"
++type ResourceTarget = "none" | "bucket" | "object" | "exactObject" | "objectPattern"
+ type RequirementMode = "all" | "any"
+ 
+ interface CapabilityRequirement {
+@@ -66,7 +66,7 @@ interface CapabilityRequirement {
+ }
+ 
+ const CAPABILITY_REQUIREMENTS: Record<ConsoleCapability, CapabilityRequirement[]> = {
+-  "bucket.create": [{ actions: ["s3:CreateBucket"], resource: "allBuckets" }],
++  "bucket.create": [{ actions: ["s3:CreateBucket"], resource: "bucket" }],
+   "bucket.delete": [{ actions: ["s3:DeleteBucket"], resource: "bucket" }],
+   "bucket.policy.put": [{ actions: ["s3:PutBucketPolicy"], resource: "bucket" }],
+   "bucket.policy.delete": [{ actions: ["s3:DeleteBucketPolicy"], resource: "bucket" }],
+@@ -141,8 +141,6 @@ function resolveResource(resource: ResourceTarget, context: PermissionResourceCo
+       return toObjectPatternArn(context.bucket, context.prefix)
+     case "objectPattern":
+       return toObjectPatternArn(context.bucket, context.prefix ?? context.objectKey)
+-    case "allBuckets":
+-      return toAllBucketsArn()
+   }
+ }
+ 
+@@ -158,6 +156,19 @@ export function hasConsoleCapability(
+   if (capability === "objects.forceCleanup" && !isForceCleanupTarget(context)) return false
+   if (!policy) return false
+ 
++  if (capability === "bucket.create" && !context.bucket) {
++    const candidates = [
++      "*",
++      ...policy.Statement.flatMap((statement) => [...(statement.Resource ?? []), ...(statement.NotResource ?? [])]),
++    ]
++    return candidates.some(
++      (resource) =>
++        !resource.includes("${") &&
++        (resource === "*" || /^arn:aws:s3:::[^/]+$/.test(resource)) &&
++        hasConsolePermission(policy, "s3:CreateBucket", resource),
++    )
++  }
++
+   const requirements = CAPABILITY_REQUIREMENTS[capability]
+   if (!requirements) return false
+ 
+diff --git a/tests/hooks/use-bucket-quota.test.ts b/tests/hooks/use-bucket-quota.test.ts
+new file mode 100644
+index 0000000..11993ef
+--- /dev/null
++++ b/tests/hooks/use-bucket-quota.test.ts
+@@ -0,0 +1,143 @@
++import test, { type TestContext } from "node:test"
++import assert from "node:assert/strict"
++import { readFileSync } from "node:fs"
++import { act, createElement } from "react"
++import { createRoot } from "react-dom/client"
++import { Window } from "happy-dom"
++import { GetBucketCorsCommand } from "@aws-sdk/client-s3"
++import ts from "typescript"
++import { ApiClient } from "../../lib/api-client"
++import type { useBucket as UseBucket } from "../../hooks/use-bucket"
++
++const mocksKey = Symbol.for("bucket-quota-test-contexts")
++const source = ts.transpileModule(readFileSync(new URL("../../hooks/use-bucket.ts", import.meta.url), "utf8"), {
++  compilerOptions: { module: ts.ModuleKind.ESNext },
++}).outputText
++const testSource = source.replace(/from "([^"]+)"/g, (match, specifier: string) => {
++  const hook =
++    specifier === "@/contexts/api-context" ? "useApi" : specifier === "@/contexts/s3-context" ? "useS3" : null
++  const stub = hook
++    ? `export function ${hook}() { return globalThis[Symbol.for("bucket-quota-test-contexts")].${hook}() }`
++    : null
++  const url = stub
++    ? `data:text/javascript,${encodeURIComponent(stub)}`
++    : specifier.startsWith("@/")
++      ? new URL(`../../${specifier.slice(2)}.ts`, import.meta.url).href
++      : import.meta.resolve(specifier)
++  return `from "${url}"`
++})
++const { useBucket } = (await import(
++  `data:text/javascript,${encodeURIComponent(testSource)}`
++)) as typeof import("../../hooks/use-bucket")
++const corsConfig = { CORSRules: [{ AllowedOrigins: ["http://localhost"], AllowedMethods: ["GET"] }] }
++
++async function mountBucket(t: TestContext, status: number, body: unknown) {
++  const browser = new Window()
++  const globals = { window: browser, document: browser.document, IS_REACT_ACT_ENVIRONMENT: true }
++  const previousDescriptors = Object.keys(globals).map(
++    (key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
++  )
++  for (const [key, value] of Object.entries(globals)) {
++    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
++  }
++  const handled: number[] = []
++  const requests: { url: string; method: string }[] = []
++  const api = new ApiClient(
++    {
++      fetch: async (input, init) => {
++        requests.push({ url: typeof input === "string" ? input : input.url, method: init?.method ?? "GET" })
++        return Response.json(body, { status })
++      },
++    },
++    {
++      baseUrl: "https://console.test/rustfs/admin/v3",
++      errorHandler: {
++        handle401: async () => {
++          handled.push(401)
++        },
++        handle403: async () => {
++          handled.push(403)
++        },
++        handleServerError: async () => {},
++        handleByStatus: async () => {},
++      },
++    },
++  )
++  Reflect.set(globalThis, mocksKey, {
++    useApi: () => api,
++    useS3: () => ({
++      send: async (command: unknown) => {
++        assert.ok(command instanceof GetBucketCorsCommand)
++        assert.deepEqual(command.input, { Bucket: "alice-photos" })
++        return corsConfig
++      },
++    }),
++  })
++  const current: { bucket?: ReturnType<typeof UseBucket> } = {}
++  function Probe() {
++    current.bucket = useBucket()
++    return null
++  }
++  const container = document.createElement("div")
++  document.body.appendChild(container)
++  const root = createRoot(container)
++  t.after(async () => {
++    await act(async () => root.unmount())
++    await browser.happyDOM.close()
++    Reflect.deleteProperty(globalThis, mocksKey)
++    for (const [key, descriptor] of previousDescriptors) {
++      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
++      else Reflect.deleteProperty(globalThis, key)
++    }
++  })
++  await act(async () => root.render(createElement(Probe)))
++  assert.ok(current.bucket)
++  return { bucket: current.bucket, handled, requests }
++}
++
++test("a denied quota read remains a local error while permitted bucket settings load", async (t) => {
++  const { bucket, handled, requests } = await mountBucket(t, 403, {
++    code: "AccessDenied",
++    message: "Quota access denied",
++  })
++  const [quota, cors] = await Promise.allSettled([
++    bucket.getBucketQuota("alice-photos"),
++    bucket.getBucketCors("alice-photos"),
++  ])
++  assert.equal(quota.status, "rejected")
++  if (quota.status !== "rejected") throw new Error("Quota denial was swallowed")
++  assert.equal(quota.reason.status, 403)
++  assert.equal(quota.reason.code, "AccessDenied")
++  assert.deepEqual(cors, { status: "fulfilled", value: corsConfig })
++  assert.deepEqual(handled, [])
++  assert.deepEqual(requests, [{ url: "https://console.test/rustfs/admin/v3/quota/alice-photos", method: "GET" }])
++})
++
++test("quota read suppression does not disable forbidden handling for quota writes", async (t) => {
++  const { bucket, handled } = await mountBucket(t, 403, { code: "AccessDenied", message: "Access denied" })
++  await assert.rejects(bucket.getBucketQuota("alice-photos"), { status: 403 })
++  handled.length = 0
++  await assert.rejects(bucket.putBucketQuota("alice-photos", { quota: 1024 }), { status: 403 })
++  assert.deepEqual(handled, [403])
++})
++
++test("an unauthenticated quota read still invokes authentication handling", async (t) => {
++  const { bucket, handled } = await mountBucket(t, 401, { message: "Session expired" })
++  await assert.rejects(bucket.getBucketQuota("alice-photos"), { status: 401, message: "Session expired" })
++  assert.deepEqual(handled, [401])
++})
++
++for (const status of [404, 500]) {
++  test(`quota HTTP ${status} remains an error rather than an empty configuration`, async (t) => {
++    const { bucket, handled } = await mountBucket(t, status, { message: `HTTP ${status}` })
++    await assert.rejects(bucket.getBucketQuota("alice-photos"), { status, message: `HTTP ${status}` })
++    assert.deepEqual(handled, [])
++  })
++}
++
++test("an authorized quota read preserves the response", async (t) => {
++  const expected = { quota: 1048576, type: "hard" }
++  const { bucket, handled } = await mountBucket(t, 200, expected)
++  assert.deepEqual(await bucket.getBucketQuota("alice-photos"), expected)
++  assert.deepEqual(handled, [])
++})
+diff --git a/tests/hooks/use-permissions.test.ts b/tests/hooks/use-permissions.test.ts
+index 636a6bb..6d90162 100644
+--- a/tests/hooks/use-permissions.test.ts
++++ b/tests/hooks/use-permissions.test.ts
+@@ -221,3 +221,67 @@ test("switching the API client clears the previous server's owner grant", async
+   )
+   assert.equal(mounted.permissions.canCapability("objects.forceCleanup", target), false)
+ })
++
++const personalNamespacePolicy = JSON.stringify({
++  Version: "2012-10-17",
++  Statement: [
++    {
++      Effect: "Allow",
++      Action: ["s3:CreateBucket", "s3:DeleteBucket", "s3:GetBucketCors", "s3:PutBucketCors", "s3:PutBucketVersioning"],
++      Resource: ["arn:aws:s3:::${jwt:preferred_username}-*"],
++    },
++    {
++      Effect: "Allow",
++      Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
++      Resource: ["arn:aws:s3:::${jwt:preferred_username}-*/*"],
++    },
++  ],
++})
++
++function makePersonalApi(username: unknown): Api {
++  return {
++    async get(path) {
++      if (path === "/is-admin" || path === "/account/info") return { is_admin: false }
++      return { policy: personalNamespacePolicy, username }
++    },
++  }
++}
++
++test("OIDC username resources enable own-bucket and object controls without cross-user access", async (t) => {
++  const mounted = await mountPermissions(t, makePersonalApi("alice"))
++  assert.equal(mounted.permissions.canCapability("bucket.create"), true)
++  for (const capability of ["bucket.create", "bucket.delete", "bucket.cors.edit", "bucket.versioning.edit"] as const) {
++    assert.equal(mounted.permissions.canCapability(capability, { bucket: "alice-photos" }), true)
++    assert.equal(mounted.permissions.canCapability(capability, { bucket: "alice2-photos" }), false)
++    assert.equal(mounted.permissions.canCapability(capability, { bucket: "bob-photos" }), false)
++  }
++  for (const capability of ["objects.upload", "objects.download", "objects.delete", "objects.copy"] as const) {
++    assert.equal(mounted.permissions.canCapability(capability, { bucket: "alice-photos", objectKey: "file" }), true)
++    assert.equal(mounted.permissions.canCapability(capability, { bucket: "bob-photos", objectKey: "file" }), false)
++  }
++  assert.equal(mounted.permissions.canCapability("bucket.policy.edit", { bucket: "alice-photos" }), false)
++})
++
++for (const username of [undefined, "", " ", 42, "*", "alice?", "${jwt:sub}"]) {
++  test(`invalid or missing OIDC username does not enable scoped controls: ${JSON.stringify(username)}`, async (t) => {
++    const mounted = await mountPermissions(t, makePersonalApi(username))
++    assert.equal(mounted.permissions.canCapability("bucket.create"), false)
++    assert.equal(mounted.permissions.canCapability("bucket.create", { bucket: "alice-photos" }), false)
++    assert.equal(mounted.permissions.canCapability("bucket.create", { bucket: "-photos" }), false)
++    assert.equal(
++      mounted.permissions.canCapability("objects.download", { bucket: "alice-photos", objectKey: "file" }),
++      false,
++    )
++  })
++}
++
++test("a new session replaces the previous username's capability context", async (t) => {
++  const mounted = await mountPermissions(t, makePersonalApi("alice"))
++  assert.equal(mounted.permissions.canCapability("bucket.create", { bucket: "alice-photos" }), true)
++  await mounted.changeCredentials(
++    { AccessKeyId: "second", SecretAccessKey: "other", SessionToken: "new-token" },
++    makePersonalApi("bob"),
++  )
++  assert.equal(mounted.permissions.canCapability("bucket.create", { bucket: "alice-photos" }), false)
++  assert.equal(mounted.permissions.canCapability("bucket.create", { bucket: "bob-photos" }), true)
++})
+diff --git a/tests/lib/console-policy-parser.test.ts b/tests/lib/console-policy-parser.test.ts
+index ea7f9a7..fc66225 100644
+--- a/tests/lib/console-policy-parser.test.ts
++++ b/tests/lib/console-policy-parser.test.ts
+@@ -20,6 +20,34 @@ const maintainerPolicy: ConsolePolicy = {
+   ],
+ }
+ 
++for (const operation of ["Get", "Put", "Delete"]) {
++  const nativeAction = `s3:${operation}BucketCors`
++  const consoleAction = `s3:${operation}BucketCORS`
++
++  test(`native ${nativeAction} grants match the console spelling only on allowed buckets`, () => {
++    const policy: ConsolePolicy = {
++      Version: "2012-10-17",
++      Statement: [{ Effect: "Allow", Action: [nativeAction], Resource: ["arn:aws:s3:::alice-*"] }],
++    }
++
++    assert.equal(hasConsolePermission(policy, consoleAction, "arn:aws:s3:::alice-photos"), true)
++    assert.equal(hasConsolePermission(policy, consoleAction, "arn:aws:s3:::alice2-photos"), false)
++    assert.equal(hasConsolePermission(policy, consoleAction, "arn:aws:s3:::bob-photos"), false)
++  })
++
++  test(`native ${nativeAction} denies override console-spelled grants`, () => {
++    const policy: ConsolePolicy = {
++      Version: "2012-10-17",
++      Statement: [
++        { Effect: "Allow", Action: [consoleAction], Resource: ["arn:aws:s3:::alice-*"] },
++        { Effect: "Deny", Action: [nativeAction], Resource: ["arn:aws:s3:::alice-photos"] },
++      ],
++    }
++
++    assert.equal(hasConsolePermission(policy, consoleAction, "arn:aws:s3:::alice-photos"), false)
++  })
++}
++
+ test("a denied browser capability does not hide the Browser page", () => {
+   assert.equal(hasConsolePermission(maintainerPolicy, CONSOLE_SCOPES.VIEW_BROWSER), true)
+ })
+diff --git a/tests/lib/scoped-bucket-capabilities.test.ts b/tests/lib/scoped-bucket-capabilities.test.ts
+new file mode 100644
+index 0000000..1f0de12
+--- /dev/null
++++ b/tests/lib/scoped-bucket-capabilities.test.ts
+@@ -0,0 +1,123 @@
++import test from "node:test"
++import assert from "node:assert/strict"
++import { hasConsoleCapability } from "../../lib/permission-capabilities"
++import {
++  hasConsolePermission,
++  resolveConsolePolicyUsername,
++  type ConsolePolicy,
++  type ConsoleStatement,
++} from "../../lib/console-policy-parser"
++
++const policy = (...Statement: ConsoleStatement[]): ConsolePolicy => ({ Version: "2012-10-17", Statement })
++const createGrant: ConsoleStatement = {
++  Effect: "Allow",
++  Action: ["s3:CreateBucket"],
++  Resource: ["arn:aws:s3:::alice-*"],
++}
++
++test("a bucket-prefix grant exposes the create dialog without granting all buckets", () => {
++  assert.equal(hasConsoleCapability(policy(createGrant), "bucket.create"), true)
++})
++
++test("creation is checked against the actual bucket once a name is supplied", () => {
++  assert.equal(hasConsoleCapability(policy(createGrant), "bucket.create", { bucket: "alice-photos" }), true)
++  for (const bucket of ["alice2-photos", "bob-photos", "alice", "unrelated"]) {
++    assert.equal(hasConsoleCapability(policy(createGrant), "bucket.create", { bucket }), false)
++  }
++})
++
++test("an exact bucket grant also exposes creation", () => {
++  const exact = policy({ ...createGrant, Resource: ["arn:aws:s3:::alice-photos"] })
++  assert.equal(hasConsoleCapability(exact, "bucket.create"), true)
++  assert.equal(hasConsoleCapability(exact, "bucket.create", { bucket: "alice-photos" }), true)
++  assert.equal(hasConsoleCapability(exact, "bucket.create", { bucket: "alice-backups" }), false)
++})
++
++test("read-only and object-only grants do not expose creation", () => {
++  assert.equal(hasConsoleCapability(policy({ ...createGrant, Action: ["s3:ListBucket"] }), "bucket.create"), false)
++  assert.equal(
++    hasConsoleCapability(policy({ ...createGrant, Resource: ["arn:aws:s3:::alice-*/*"] }), "bucket.create"),
++    false,
++  )
++})
++
++test("global and complete-prefix denies still suppress creation", () => {
++  for (const Resource of [["*"], ["arn:aws:s3:::*"], ["arn:aws:s3:::alice-*"]]) {
++    const denied = policy(createGrant, { Effect: "Deny", Action: ["s3:CreateBucket"], Resource })
++    assert.equal(hasConsoleCapability(denied, "bucket.create"), false)
++    assert.equal(hasConsoleCapability(denied, "bucket.create", { bucket: "alice-photos" }), false)
++  }
++})
++
++test("a denied bucket does not hide creation elsewhere in an allowed prefix", () => {
++  const scoped = policy(createGrant, {
++    Effect: "Deny",
++    Action: ["s3:CreateBucket"],
++    Resource: ["arn:aws:s3:::alice-private"],
++  })
++  assert.equal(hasConsoleCapability(scoped, "bucket.create"), true)
++  assert.equal(hasConsoleCapability(scoped, "bucket.create", { bucket: "alice-photos" }), true)
++  assert.equal(hasConsoleCapability(scoped, "bucket.create", { bucket: "alice-private" }), false)
++})
++
++test("NotResource exceptions are considered for creation discovery and named checks", () => {
++  const scoped = policy(
++    { ...createGrant, Resource: ["*"] },
++    { Effect: "Deny", Action: ["s3:CreateBucket"], NotResource: ["arn:aws:s3:::alice-*"] },
++  )
++  assert.equal(hasConsoleCapability(scoped, "bucket.create"), true)
++  assert.equal(hasConsoleCapability(scoped, "bucket.create", { bucket: "alice-photos" }), true)
++  assert.equal(hasConsoleCapability(scoped, "bucket.create", { bucket: "bob-photos" }), false)
++})
++
++test("NotAction cannot be bypassed by creation discovery", () => {
++  assert.equal(hasConsoleCapability(policy({ ...createGrant, NotAction: ["s3:CreateBucket"] }), "bucket.create"), false)
++  assert.equal(
++    hasConsoleCapability(
++      policy(createGrant, { Effect: "Deny", NotAction: ["s3:ListBucket"], Resource: ["*"] }),
++      "bucket.create",
++    ),
++    false,
++  )
++})
++
++test("unresolved resource variables never act as creation candidates", () => {
++  assert.equal(
++    hasConsoleCapability(
++      policy({ ...createGrant, Resource: ["arn:aws:s3:::${jwt:preferred_username}-*"] }),
++      "bucket.create",
++    ),
++    false,
++  )
++})
++
++test("existing unrestricted creation grants retain their behavior", () => {
++  const unrestricted = policy({ ...createGrant, Resource: ["arn:aws:s3:::*"] })
++  assert.equal(hasConsoleCapability(unrestricted, "bucket.create"), true)
++  assert.equal(hasConsoleCapability(unrestricted, "bucket.create", { bucket: "arbitrary-bucket" }), true)
++})
++
++test("username resolution preserves the source policy and applies to exclusions", () => {
++  const original = policy(
++    { ...createGrant, Resource: ["arn:aws:s3:::${jwt:preferred_username}-*"] },
++    {
++      Effect: "Deny",
++      Action: ["s3:CreateBucket"],
++      NotResource: ["arn:aws:s3:::${jwt:preferred_username}-photos"],
++    },
++  )
++  const before = JSON.stringify(original)
++  const resolved = resolveConsolePolicyUsername(original, "alice")
++  assert.equal(JSON.stringify(original), before)
++  assert.equal(hasConsoleCapability(resolved, "bucket.create", { bucket: "alice-photos" }), true)
++  assert.equal(hasConsoleCapability(resolved, "bucket.create", { bucket: "alice-backups" }), false)
++  assert.equal(hasConsoleCapability(resolved, "bucket.create", { bucket: "bob-photos" }), false)
++})
++
++test("unknown variables are not turned into wildcards or guessed from the username", () => {
++  const original = policy({ ...createGrant, Resource: ["arn:aws:s3:::${jwt:sub}-*"] })
++  const resolved = resolveConsolePolicyUsername(original, "alice")
++  assert.deepEqual(resolved.Statement[0]?.Resource, ["arn:aws:s3:::${jwt:sub}-*"])
++  assert.equal(hasConsoleCapability(resolved, "bucket.create"), false)
++  assert.equal(hasConsolePermission(resolved, "s3:CreateBucket", "arn:aws:s3:::alice-photos"), false)
++})
+diff --git a/tests/lib/scoped-bucket-form.test.ts b/tests/lib/scoped-bucket-form.test.ts
+new file mode 100644
+index 0000000..6fa9934
+--- /dev/null
++++ b/tests/lib/scoped-bucket-form.test.ts
+@@ -0,0 +1,181 @@
++import test, { type TestContext } from "node:test"
++import assert from "node:assert/strict"
++import { readFileSync } from "node:fs"
++import * as React from "react"
++import { createRoot } from "react-dom/client"
++import { Window } from "happy-dom"
++import ts from "typescript"
++import { hasConsoleCapability } from "../../lib/permission-capabilities"
++import type { ConsoleCapability } from "../../lib/permission-capabilities"
++import type { PermissionResourceContext } from "../../lib/permission-resources"
++import type { ConsolePolicy } from "../../lib/console-policy-parser"
++
++const mocksKey = Symbol.for("scoped-bucket-form")
++const source = ts.transpileModule(
++  readFileSync(new URL("../../components/buckets/new-form.tsx", import.meta.url), "utf8"),
++  { compilerOptions: { module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.ReactJSX } },
++).outputText
++const testSource = source.replace(/import (.*?) from "([^"]+)";/gs, (statement, bindings, specifier: string) => {
++  if ((!specifier.startsWith("@/") && specifier !== "react-i18next") || specifier === "@/lib/bucket-name") {
++    const url = specifier.startsWith("@/")
++      ? new URL(`../../${specifier.slice(2)}.ts`, import.meta.url).href
++      : import.meta.resolve(specifier)
++    return `import ${bindings} from "${url}";`
++  }
++  const stub = bindings
++    .replace(/[{}\s]/g, "")
++    .split(",")
++    .filter(Boolean)
++    .map(
++      (name: string) =>
++        `export const ${name} = (...args) => globalThis[Symbol.for("scoped-bucket-form")]["${name}"](...args);`,
++    )
++    .join("\n")
++  return statement.replace(specifier, `data:text/javascript,${encodeURIComponent(stub)}`)
++})
++const { BucketNewForm } = (await import(
++  `data:text/javascript,${encodeURIComponent(testSource)}`
++)) as typeof import("../../components/buckets/new-form")
++
++async function mountForm(t: TestContext) {
++  const browser = new Window()
++  const globals = { window: browser, document: browser.document, IS_REACT_ACT_ENVIRONMENT: true }
++  const descriptors = Object.keys(globals).map(
++    (key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
++  )
++  for (const [key, value] of Object.entries(globals)) {
++    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
++  }
++
++  const policy: ConsolePolicy = {
++    Version: "2012-10-17",
++    Statement: [{ Effect: "Allow", Action: ["s3:CreateBucket"], Resource: ["arn:aws:s3:::alice-*"] }],
++  }
++  const errors: string[] = []
++  const requests: { Bucket: string; ObjectLockEnabledForBucket?: boolean }[] = []
++  let submit: (() => Promise<void>) | undefined
++  let changeName: ((event: { target: { value: string } }) => void) | undefined
++  let submitDisabled = true
++  const passthrough = ({ children }: { children?: React.ReactNode }) => React.createElement("div", null, children)
++  Reflect.set(globalThis, mocksKey, {
++    useTranslation: () => ({ t: (key: string) => key }),
++    useMessage: () => ({
++      error: (message: string) => errors.push(message),
++      success: () => {},
++    }),
++    usePermissions: () => ({
++      canCapability: (capability: ConsoleCapability, context?: PermissionResourceContext) =>
++        hasConsoleCapability(policy, capability, context),
++    }),
++    useBucket: () => ({
++      createBucket: async (request: { Bucket: string; ObjectLockEnabledForBucket?: boolean }) => {
++        requests.push(request)
++      },
++      putBucketVersioning: () => assert.fail("Unrequested versioning update"),
++      putObjectLockConfiguration: () => assert.fail("Unrequested object-lock update"),
++      putBucketQuota: () => assert.fail("Unrequested quota update"),
++    }),
++    Button: ({
++      children,
++      variant,
++      disabled,
++      onClick,
++    }: {
++      children?: React.ReactNode
++      variant: string
++      disabled?: boolean
++      onClick: () => Promise<void>
++    }) => {
++      if (variant === "default") {
++        submit = onClick
++        submitDisabled = !!disabled
++      }
++      return React.createElement("button", { disabled, onClick }, children)
++    },
++    Input: ({
++      id,
++      value,
++      onChange,
++    }: {
++      id?: string
++      value: string
++      onChange: (event: { target: { value: string } }) => void
++    }) => {
++      if (id === "bucket-name") changeName = onChange
++      return React.createElement("input", { id, value, readOnly: true })
++    },
++    Alert: passthrough,
++    AlertDescription: passthrough,
++    AlertTitle: passthrough,
++    Field: passthrough,
++    FieldContent: passthrough,
++    FieldLabel: passthrough,
++    FieldError: ({ children }: { children?: React.ReactNode }) =>
++      React.createElement("div", { role: "alert" }, children),
++    Switch: passthrough,
++    RadioGroup: passthrough,
++    RadioGroupItem: passthrough,
++    Dialog: passthrough,
++    DialogBody: passthrough,
++    DialogSection: passthrough,
++    DialogContent: passthrough,
++    DialogFooter: passthrough,
++    DialogHeader: passthrough,
++    DialogTitle: passthrough,
++    getBytes: () => assert.fail("Unrequested quota calculation"),
++    cn: (...values: unknown[]) => values.filter(Boolean).join(" "),
++  })
++
++  const container = document.createElement("div")
++  document.body.appendChild(container)
++  const root = createRoot(container)
++  t.after(async () => {
++    await React.act(async () => root.unmount())
++    await browser.happyDOM.close()
++    Reflect.deleteProperty(globalThis, mocksKey)
++    for (const [key, descriptor] of descriptors) {
++      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
++      else Reflect.deleteProperty(globalThis, key)
++    }
++  })
++  await React.act(async () => root.render(React.createElement(BucketNewForm, { show: true, onShowChange() {} })))
++
++  return {
++    errors,
++    requests,
++    get disabled() {
++      return submitDisabled
++    },
++    get feedback() {
++      return [...container.querySelectorAll('[role="alert"]')].map((element) => element.textContent).join(" ")
++    },
++    async enterName(value: string) {
++      assert.ok(changeName)
++      await React.act(async () => changeName!({ target: { value } }))
++    },
++    async create() {
++      assert.ok(submit)
++      await React.act(async () => submit!())
++    },
++  }
++}
++
++test("the create form enables only an entered name inside the allowed namespace", async (t) => {
++  const form = await mountForm(t)
++  assert.equal(form.disabled, true)
++  await form.enterName("alice-photos")
++  assert.equal(form.disabled, false)
++  assert.equal(form.feedback.includes("Access Denied"), false)
++  await form.create()
++  assert.deepEqual(form.requests, [{ Bucket: "alice-photos", ObjectLockEnabledForBucket: false }])
++})
++
++test("the create form rejects lookalike names visibly without issuing an S3 request", async (t) => {
++  const form = await mountForm(t)
++  await form.enterName("alice2-photos")
++  assert.equal(form.disabled, true)
++  assert.equal(form.feedback.includes("Access Denied"), true)
++  await form.create()
++  assert.deepEqual(form.errors, ["Access Denied"])
++  assert.deepEqual(form.requests, [])
++})

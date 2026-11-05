@@ -1,0 +1,411 @@
+From d229c79e38d128a29accad5deebfb13cdec11475 Mon Sep 17 00:00:00 2001
+From: cozima <cozima0210@yahoo.co.jp>
+Date: Sat, 24 Oct 2026 16:53:36 +0900
+Subject: [PATCH] fix(s3): apply bucket CORS to virtual-hosted-style requests
+ (#8860)
+
+ConditionalCorsLayer took the bucket from the first path segment only.
+With RUSTFS_SERVER_DOMAINS set, a virtual-hosted-style request such as
+OPTIONS http://mybucket.localhost:9000/x.jpg was evaluated against a
+bucket named "x.jpg", so a preflight never matched the bucket's CORS
+configuration and returned 200 without Access-Control-* headers, while
+the same request in path style succeeded.
+
+Resolve the bucket from the host prefix first, reusing the virtual-host
+matching that the API rate limiter already uses, and fall back to the
+first path segment for path-style requests. A bucket-level request on a
+virtual host ("/") is now treated as a bucket request instead of the
+server root.
+
+Co-authored-by: cozima <8464261+cozima@users.noreply.github.com>
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rustfs/src/server/http.rs       | 28 ++++++++++-----
+ rustfs/src/server/layer.rs      | 45 +++++++++++++++++++++----
+ rustfs/src/server/rate_limit.rs | 60 +++++++++++++++++++++++++--------
+ 3 files changed, 104 insertions(+), 29 deletions(-)
+
+diff --git a/rustfs/src/server/http.rs b/rustfs/src/server/http.rs
+index 3389fe7362..ea45ceaa8b 100644
+--- a/rustfs/src/server/http.rs
++++ b/rustfs/src/server/http.rs
+@@ -28,7 +28,7 @@ use crate::server::{
+         PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
+         SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+     },
+-    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
++    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
+     ssec_transport::SsecTransportLayer,
+     strip_valid_port_suffix,
+     tls_material::{
+@@ -1107,7 +1107,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
+ macro_rules! external_service_stack {
+     ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
+      $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
+-     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr) => {{
++     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr, $vh_domain_hosts:expr) => {{
+         let remote_addr = $remote_addr;
+         let trusted_proxy_layer = $trusted_proxy_layer;
+         let is_console = $is_console;
+@@ -1118,6 +1118,7 @@ macro_rules! external_service_stack {
+         let compression_config = $compression_config;
+         let server_ctx = $server_ctx;
+         let server_domains_configured = $server_domains_configured;
++        let vh_domain_hosts = $vh_domain_hosts;
+         ServiceBuilder::new()
+             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+@@ -1237,7 +1238,7 @@ macro_rules! external_service_stack {
+             .layer(S3ErrorMessageCompatLayer)
+             .layer(IcebergRestErrorCompatLayer)
+             .layer(ObjectAttributesEtagFixLayer)
+-            .layer(ConditionalCorsLayer::new())
++            .layer(ConditionalCorsLayer::new().with_vh_domain_hosts(vh_domain_hosts))
+             .option_layer(if is_console { Some(RedirectLayer) } else { None })
+             .layer(BodylessStatusFixLayer)
+             .layer(HeadRequestBodyFixLayer)
+@@ -1558,6 +1559,8 @@ pub async fn start_http_server(
+     // overlap with the bare domains they were generated from.
+     let host_domain_sets = s3_host_domains(config)?;
+     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
++    // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
++    let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
+ 
+     // Setup S3 service
+     // This project uses the S3S library to implement S3 services
+@@ -1711,6 +1714,7 @@ pub async fn start_http_server(
+         let h3_compression = compression_config.clone();
+         let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
+         let h3_domains_configured = !config.server_domains.is_empty();
++        let h3_vh_domain_hosts = vh_domain_hosts.clone();
+ 
+         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
+             let remote_addr = RemoteAddr(peer_addr);
+@@ -1741,7 +1745,8 @@ pub async fn start_http_server(
+                 h3_keystone.clone(),
+                 h3_compression.clone(),
+                 h3_server_ctx.clone(),
+-                h3_domains_configured
++                h3_domains_configured,
++                h3_vh_domain_hosts.clone()
+             ))
+         };
+ 
+@@ -2004,6 +2009,7 @@ pub async fn start_http_server(
+                 compression_config: compression_config.clone(),
+                 is_console,
+                 server_domains_configured,
++                vh_domain_hosts: vh_domain_hosts.clone(),
+                 readiness: readiness.clone(),
+                 keystone_auth: auth_keystone::get_keystone_auth(),
+                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
+@@ -2081,6 +2087,8 @@ struct ConnectionContext {
+     is_console: bool,
+     /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).
+     server_domains_configured: bool,
++    /// Port-stripped virtual-hosted-style domains, for bucket-level CORS resolution.
++    vh_domain_hosts: Arc<[String]>,
+     readiness: Arc<GlobalReadiness>,
+     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
+     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+@@ -2241,6 +2249,7 @@ fn process_connection(
+             compression_config,
+             is_console,
+             server_domains_configured,
++            vh_domain_hosts,
+             readiness,
+             keystone_auth,
+             trusted_proxy_layer,
+@@ -2362,7 +2371,8 @@ fn process_connection(
+                 keystone_auth.clone(),
+                 compression_config.clone(),
+                 server_ctx.clone(),
+-                server_domains_configured
++                server_domains_configured,
++                vh_domain_hosts.clone()
+             )
+         };
+         let build_internode_stack = |service| {
+@@ -2875,7 +2885,8 @@ mod tests {
+             None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+             HttpCompressionConfig::default(),
+             ServerContextSlot::new(),
+-            false
++            false,
++            Arc::default()
+         ))
+     }
+ 
+@@ -5130,7 +5141,7 @@ mod tests {
+                 let inner = Http3CoreService::new(inner);
+                 Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
+                     Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
+-                    HttpCompressionConfig::default(), ServerContextSlot::new(), false))
++                    HttpCompressionConfig::default(), ServerContextSlot::new(), false, Arc::default()))
+             }, 0, Duration::from_secs(1), receiver)?;
+             let client_endpoint = client_endpoint(vec![cert])?;
+             let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
+@@ -5188,7 +5199,8 @@ mod tests {
+                     None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+                     HttpCompressionConfig::default(),
+                     ServerContextSlot::new(),
+-                    false
++                    false,
++                    Arc::default()
+                 ))
+             },
+             0,
+diff --git a/rustfs/src/server/layer.rs b/rustfs/src/server/layer.rs
+index 59fc2b5f3a..f6551f4667 100644
+--- a/rustfs/src/server/layer.rs
++++ b/rustfs/src/server/layer.rs
+@@ -19,6 +19,7 @@ use crate::error::ApiError;
+ use crate::server::RemoteAddr;
+ use crate::server::cors;
+ use crate::server::hybrid::{HybridBody, is_grpc_request};
++use crate::server::rate_limit::virtual_host_bucket;
+ use crate::server::{
+     ADMIN_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
+     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
+@@ -2079,12 +2080,24 @@ fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
+ #[derive(Clone)]
+ pub struct ConditionalCorsLayer {
+     cors_origins: Option<String>,
++    /// Port-stripped `RUSTFS_SERVER_DOMAINS` hosts, used to resolve the bucket
++    /// of virtual-hosted-style requests. Empty when virtual hosting is off.
++    vh_domain_hosts: Arc<[String]>,
+ }
+ 
+ impl ConditionalCorsLayer {
+     pub fn new() -> Self {
+         let cors_origins = get_env_opt_str(rustfs_config::ENV_CORS_ALLOWED_ORIGINS).filter(|s| !s.is_empty());
+-        Self { cors_origins }
++        Self {
++            cors_origins,
++            vh_domain_hosts: Arc::default(),
++        }
++    }
++
++    /// Resolve bucket-level CORS for virtual-hosted-style requests on these domains.
++    pub fn with_vh_domain_hosts(mut self, vh_domain_hosts: Arc<[String]>) -> Self {
++        self.vh_domain_hosts = vh_domain_hosts;
++        self
+     }
+ 
+     /// Exact paths that should be excluded from being treated as S3 paths.
+@@ -2171,6 +2184,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
+         ConditionalCorsService {
+             inner,
+             cors_origins: Arc::new(self.cors_origins.clone()),
++            vh_domain_hosts: self.vh_domain_hosts.clone(),
+         }
+     }
+ }
+@@ -2180,6 +2194,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
+ pub struct ConditionalCorsService<S> {
+     inner: S,
+     cors_origins: Arc<Option<String>>,
++    vh_domain_hosts: Arc<[String]>,
+ }
+ 
+ async fn resolve_s3_options_cors_headers(bucket: &str, request_headers: &HeaderMap) -> Option<HeaderMap> {
+@@ -2233,8 +2248,11 @@ where
+         let method = req.method().clone();
+         let request_headers = req.headers().clone();
+         let cors_origins = self.cors_origins.clone();
++        // A virtual-hosted-style request carries its bucket in the host, so its
++        // path is the object key (or `/` for a bucket-level request).
++        let vh_bucket = virtual_host_bucket(&req, &self.vh_domain_hosts).map(str::to_owned);
+         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
+-        let is_root = path == "/";
++        let is_root = path == "/" && vh_bucket.is_none();
+ 
+         if is_options {
+             let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
+@@ -2254,6 +2272,7 @@ where
+                         .expect("valid response body");
+                     let cors_layer = ConditionalCorsLayer {
+                         cors_origins: (*cors_origins).clone(),
++                        vh_domain_hosts: Arc::default(),
+                     };
+                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                     Ok(response)
+@@ -2261,8 +2280,8 @@ where
+             }
+ 
+             if is_s3 {
+-                let path_trimmed = path.trim_start_matches('/');
+-                let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
++                let bucket =
++                    vh_bucket.unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or("").to_string());
+ 
+                 return Box::pin(async move {
+                     if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
+@@ -2274,6 +2293,7 @@ where
+ 
+                     let cors_layer = ConditionalCorsLayer {
+                         cors_origins: (*cors_origins).clone(),
++                        vh_domain_hosts: Arc::default(),
+                     };
+ 
+                     if let Some(cors_headers) = resolve_s3_options_cors_headers(&bucket, &request_headers).await {
+@@ -2310,6 +2330,7 @@ where
+                     .expect("valid response body");
+                 let cors_layer = ConditionalCorsLayer {
+                     cors_origins: (*cors_origins).clone(),
++                    vh_domain_hosts: Arc::default(),
+                 };
+                 cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
+                 Ok(response)
+@@ -2326,11 +2347,14 @@ where
+             {
+                 let cors_layer = ConditionalCorsLayer {
+                     cors_origins: (*cors_origins).clone(),
++                    vh_domain_hosts: Arc::default(),
+                 };
+ 
+                 if is_s3 {
+-                    let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
+-                    if path == "/" {
++                    let bucket = vh_bucket
++                        .as_deref()
++                        .unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or(""));
++                    if is_root {
+                         cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                     } else if !bucket.is_empty() {
+                         match apply_cors_headers(bucket, &method, &request_headers).await {
+@@ -5171,7 +5195,10 @@ mod tests {
+ 
+     #[test]
+     fn test_generic_cors_layer_omits_headers_without_configured_origins() {
+-        let cors = ConditionalCorsLayer { cors_origins: None };
++        let cors = ConditionalCorsLayer {
++            cors_origins: None,
++            vh_domain_hosts: Arc::default(),
++        };
+         let mut req_headers = HeaderMap::new();
+         req_headers.insert("origin", "https://example.com".parse().unwrap());
+ 
+@@ -5189,6 +5216,7 @@ mod tests {
+     fn test_generic_cors_layer_respects_configured_origins() {
+         let cors = ConditionalCorsLayer {
+             cors_origins: Some("https://allowed.com".to_string()),
++            vh_domain_hosts: Arc::default(),
+         };
+ 
+         let mut req_headers = HeaderMap::new();
+@@ -5218,6 +5246,7 @@ mod tests {
+     fn test_generic_cors_layer_wildcard_does_not_allow_credentials() {
+         let cors = ConditionalCorsLayer {
+             cors_origins: Some("*".to_string()),
++            vh_domain_hosts: Arc::default(),
+         };
+ 
+         let mut req_headers = HeaderMap::new();
+@@ -5261,6 +5290,7 @@ mod tests {
+     async fn conditional_cors_passthrough_without_origin() {
+         let layer = ConditionalCorsLayer {
+             cors_origins: Some("*".to_string()),
++            vh_domain_hosts: Arc::default(),
+         };
+         let mut service = layer.layer(CorsOkService);
+         let request = Request::builder()
+@@ -5279,6 +5309,7 @@ mod tests {
+     async fn conditional_cors_applies_origin_headers() {
+         let layer = ConditionalCorsLayer {
+             cors_origins: Some("*".to_string()),
++            vh_domain_hosts: Arc::default(),
+         };
+         let mut service = layer.layer(CorsOkService);
+         let request = Request::builder()
+diff --git a/rustfs/src/server/rate_limit.rs b/rustfs/src/server/rate_limit.rs
+index ca39b8d286..5762a8fdd0 100644
+--- a/rustfs/src/server/rate_limit.rs
++++ b/rustfs/src/server/rate_limit.rs
+@@ -339,7 +339,7 @@ fn bounded_bucket_name(bucket: &str) -> Option<&str> {
+     (!bucket.is_empty() && bucket.len() <= MAX_BUCKET_NAME_LENGTH).then_some(bucket)
+ }
+ 
+-fn rate_limit_vh_domain_hosts(vh_domains: Vec<String>) -> Arc<[String]> {
++pub(crate) fn rate_limit_vh_domain_hosts(vh_domains: Vec<String>) -> Arc<[String]> {
+     let mut domains = Vec::with_capacity(vh_domains.len());
+     let mut seen = HashSet::with_capacity(vh_domains.len());
+ 
+@@ -367,25 +367,36 @@ fn request_bucket<'a, B>(req: &'a Request<B>, vh_domain_hosts: &[String]) -> Opt
+         return None;
+     }
+ 
+-    if !vh_domain_hosts.is_empty()
+-        && let Some(host) = request_host(req)
+-    {
+-        let host = strip_valid_port_suffix(host);
+-        for domain_host in vh_domain_hosts {
+-            if host.eq_ignore_ascii_case(domain_host) {
+-                // Path-style request on the API domain itself.
+-                break;
+-            }
+-            if let Some(bucket) = strip_vh_prefix(host, domain_host) {
+-                return bounded_bucket_name(bucket);
+-            }
+-        }
++    if let Some(bucket) = virtual_host_bucket(req, vh_domain_hosts) {
++        return bounded_bucket_name(bucket);
+     }
+ 
+     let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
+     bounded_bucket_name(bucket)
+ }
+ 
++/// Extract the bucket from the host prefix of a virtual-hosted-style request.
++///
++/// Returns `None` for path-style requests: when no domains are configured,
++/// when the host is exactly a configured domain, or when it matches none.
++pub(crate) fn virtual_host_bucket<'a, B>(req: &'a Request<B>, vh_domain_hosts: &[String]) -> Option<&'a str> {
++    if vh_domain_hosts.is_empty() {
++        return None;
++    }
++
++    let host = strip_valid_port_suffix(request_host(req)?);
++    for domain_host in vh_domain_hosts {
++        if host.eq_ignore_ascii_case(domain_host) {
++            // Path-style request on the API domain itself.
++            return None;
++        }
++        if let Some(bucket) = strip_vh_prefix(host, domain_host) {
++            return Some(bucket);
++        }
++    }
++    None
++}
++
+ /// Paths exempt from S3 API rate limiting.
+ ///
+ /// - Health/profiling probes: kubelet and load-balancer checks must never be
+@@ -868,6 +879,27 @@ mod tests {
+         assert_eq!(request_bucket(&other, &domains), Some("photos"));
+     }
+ 
++    #[test]
++    fn virtual_host_bucket_only_resolves_host_prefix() {
++        let domains = vh_domain_hosts(&["localhost:9000"]);
++
++        let vh = request_with_host("mybucket.localhost:9000", "/x.jpg");
++        assert_eq!(virtual_host_bucket(&vh, &domains), Some("mybucket"));
++
++        let vh_root = request_with_host("mybucket.localhost:9000", "/");
++        assert_eq!(virtual_host_bucket(&vh_root, &domains), Some("mybucket"));
++
++        // Path-style requests carry the bucket in the path, not the host.
++        let path_style = request_with_host("localhost:9000", "/mybucket/x.jpg");
++        assert_eq!(virtual_host_bucket(&path_style, &domains), None);
++
++        let other = request_with_host("cdn.other.net", "/mybucket/x.jpg");
++        assert_eq!(virtual_host_bucket(&other, &domains), None);
++
++        let no_domains = vh_domain_hosts(&[]);
++        assert_eq!(virtual_host_bucket(&vh, &no_domains), None);
++    }
++
+     #[test]
+     fn request_bucket_matches_virtual_hosted_domains_port_agnostically() {
+         let domains = vh_domain_hosts(&["s3.example.com:1234"]);

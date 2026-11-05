@@ -1,0 +1,178 @@
+diff --git a/crates/policy/src/policy/function/key_name.rs b/crates/policy/src/policy/function/key_name.rs
+index 9ead5ca..a8cb597 100644
+--- a/crates/policy/src/policy/function/key_name.rs
++++ b/crates/policy/src/policy/function/key_name.rs
+@@ -138,14 +138,7 @@ impl KeyName {
+     }
+ 
+     pub fn var_name(&self) -> String {
+-        match self {
+-            KeyName::Aws(s) => format!("${{aws:{}}}", Into::<&str>::into(s)),
+-            KeyName::Jwt(s) => format!("${{jwt:{}}}", Into::<&str>::into(s)),
+-            KeyName::Ldap(s) => format!("${{ldap:{}}}", Into::<&str>::into(s)),
+-            KeyName::Sts(s) => format!("${{sts:{}}}", Into::<&str>::into(s)),
+-            KeyName::Svc(s) => format!("${{svc:{}}}", Into::<&str>::into(s)),
+-            KeyName::S3(s) => format!("${{s3:{}}}", Into::<&str>::into(s)),
+-        }
++        format!("${{{}}}", Into::<&str>::into(self))
+     }
+ }
+ 
+@@ -472,4 +465,12 @@ mod tests {
+     fn key_name_from_str_supports_jwt_roles() {
+         assert!(KeyName::try_from("jwt:roles").is_ok());
+     }
++
++    #[test_case(KeyName::Aws(AwsKeyName::AWSSourceIP), "${aws:SourceIp}")]
++    #[test_case(KeyName::Jwt(JwtKeyName::JWTPrefUsername), "${jwt:preferred_username}")]
++    #[test_case(KeyName::Ldap(LdapKeyName::Username), "${ldap:username}")]
++    #[test_case(KeyName::S3(S3KeyName::S3LocationConstraint), "${s3:LocationConstraint}")]
++    fn var_name_matches_policy_variable_syntax(key: KeyName, expected: &str) {
++        assert_eq!(key.var_name(), expected);
++    }
+ }
+diff --git a/crates/policy/src/policy/function/string.rs b/crates/policy/src/policy/function/string.rs
+index 983f79d..ef0c8d3 100644
+--- a/crates/policy/src/policy/function/string.rs
++++ b/crates/policy/src/policy/function/string.rs
+@@ -73,6 +73,18 @@ impl StringFunc {
+     }
+ }
+ 
++fn substitute_common_keys(mut c: String, values: &HashMap<String, Vec<String>>) -> String {
++    for key in KeyName::COMMON_KEYS {
++        if let Some(v) = values.get(key.name()).and_then(|x| x.first())
++            && !v.is_empty()
++        {
++            c = c.replace(&key.var_name(), v);
++        }
++    }
++
++    c
++}
++
+ impl FuncKeyValue<StringFuncValue> {
+     async fn eval(
+         &self,
+@@ -110,17 +122,7 @@ impl FuncKeyValue<StringFuncValue> {
+         let fvalues = resolved_values
+             .into_iter()
+             .flatten()
+-            .map(|resolved_c| {
+-                let mut c = Cow::from(resolved_c);
+-                for key in KeyName::COMMON_KEYS {
+-                    match values.get(key.name()).and_then(|x| x.first()) {
+-                        Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
+-                        _ => continue,
+-                    };
+-                }
+-
+-                c
+-            })
++            .map(|resolved_c| Cow::from(substitute_common_keys(resolved_c, values)))
+             .map(|x| if ignore_case { Cow::Owned(x.to_lowercase()) } else { x })
+             .collect::<Set<_>>();
+ 
+@@ -159,17 +161,7 @@ impl FuncKeyValue<StringFuncValue> {
+                 let matched = resolved_values
+                     .into_iter()
+                     .flatten()
+-                    .map(|resolved_c| {
+-                        let mut c = Cow::from(resolved_c);
+-                        for key in KeyName::COMMON_KEYS {
+-                            match values.get(key.name()).and_then(|x| x.first()) {
+-                                Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
+-                                _ => continue,
+-                            };
+-                        }
+-
+-                        c
+-                    })
++                    .map(|resolved_c| substitute_common_keys(resolved_c, values))
+                     .any(|x| wildcard::is_match(x, v));
+ 
+                 // Unqualified evaluation reports the plain aggregate match and lets the
+@@ -389,6 +381,42 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn test_condition_values_substitute_variables_after_other_common_keys() {
++        let request = || {
++            vec![
++                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
++                ("SourceIp", vec!["192.0.2.10"]),
++                ("preferred_username", vec!["alice"]),
++                ("prefix", vec!["alice/photos/"]),
++            ]
++        };
++
++        assert!(test_eval_like(
++            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
++            false,
++            false,
++            request()
++        ));
++        assert!(test_eval(
++            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/photos/"]),
++            false,
++            false,
++            false,
++            request()
++        ));
++        assert!(!test_eval_like(
++            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
++            false,
++            false,
++            vec![
++                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
++                ("preferred_username", vec!["bob"]),
++                ("prefix", vec!["alice/photos/"]),
++            ]
++        ));
++    }
++
+     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
+     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
+     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => false ; "3")]
+diff --git a/crates/policy/src/policy/resource.rs b/crates/policy/src/policy/resource.rs
+index 262b13f..cf17fef 100644
+--- a/crates/policy/src/policy/resource.rs
++++ b/crates/policy/src/policy/resource.rs
+@@ -396,4 +396,36 @@ mod tests {
+         let round_trip: ResourceSet = serde_json::from_str(&json).expect("serialized set should deserialize");
+         assert_eq!(round_trip, set);
+     }
++
++    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/alice/photo.jpg" => true; "jwt variable")]
++    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/bob/photo.jpg" => false; "jwt variable other user")]
++    #[test_case("arn:aws:s3:::mybucket/${ldap:username}/*", "mybucket/alice-ldap/photo.jpg" => true; "ldap variable")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*", "alice-photos" => true; "own bucket")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*", "bob-photos" => false; "other user bucket")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*", "alice2-photos" => false; "lookalike username bucket")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*", "alice" => false; "bucket without namespace separator")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*/*", "alice-photos/photo.jpg" => true; "own object")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*/*", "bob-photos/photo.jpg" => false; "other user object")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*/*", "alice2-photos/photo.jpg" => false; "lookalike username object")]
++    fn test_resource_is_match_substitutes_condition_variables(resource: &str, object: &str) -> bool {
++        let resource: Resource = resource.try_into().unwrap();
++        let conditions = HashMap::from([
++            ("preferred_username".to_string(), vec!["alice".to_string()]),
++            ("username".to_string(), vec!["alice-ldap".to_string()]),
++        ]);
++
++        pollster::block_on(resource.is_match(object, &conditions))
++    }
++
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*", "alice-photos"; "bucket requires username")]
++    #[test_case("arn:aws:s3:::${jwt:preferred_username}-*/*", "alice-photos/photo.jpg"; "object requires username")]
++    fn test_resource_namespace_requires_username(resource: &str, object: &str) {
++        let resource: Resource = resource.try_into().unwrap();
++        for conditions in [
++            HashMap::new(),
++            HashMap::from([("preferred_username".to_string(), vec![String::new()])]),
++        ] {
++            assert!(!pollster::block_on(resource.is_match(object, &conditions)));
++        }
++    }
+ }

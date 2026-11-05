@@ -1,0 +1,3 @@
+policy-variables.patch text eol=lf
+virtual-hosted-cors.patch text eol=lf
+console-scoped-permissions.patch text eol=lf

@@ -1,0 +1,30 @@
+name: image-builder-rustfs
+
+services:
+  rustfs:
+    image: containers.kritikos.io/system/rustfs:${RUSTFS_IMAGE_TAG:?Set RUSTFS_IMAGE_TAG in rustfs/.env}
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Containerfile
+      provenance: mode=max
+      sbom: true
+      args:
+        RUSTFS_VERSION: ${RUSTFS_VERSION:?Set RUSTFS_VERSION in rustfs/.env}
+        RUSTFS_IMAGE_TAG: ${RUSTFS_IMAGE_TAG:?Set RUSTFS_IMAGE_TAG in rustfs/.env}
+        RUSTFS_SOURCE_COMMIT: ${RUSTFS_SOURCE_COMMIT:?Set RUSTFS_SOURCE_COMMIT in rustfs/.env}
+        RUSTFS_BASE_IMAGE: ${RUSTFS_BASE_IMAGE:?Set RUSTFS_BASE_IMAGE in rustfs/.env}
+        RUST_BUILDER_IMAGE: ${RUST_BUILDER_IMAGE:?Set RUST_BUILDER_IMAGE in rustfs/.env}
+        NODE_BUILDER_IMAGE: ${NODE_BUILDER_IMAGE:?Set NODE_BUILDER_IMAGE in rustfs/.env}
+        PNPM_VERSION: ${PNPM_VERSION:?Set PNPM_VERSION in rustfs/.env}
+        RUST_TOOLCHAIN: ${RUST_TOOLCHAIN:?Set RUST_TOOLCHAIN in rustfs/.env}
+        RUSTFS_PATCH_SHA256: ${RUSTFS_PATCH_SHA256:?Set RUSTFS_PATCH_SHA256 in rustfs/.env}
+        RUSTFS_CORS_PATCH_SHA256: ${RUSTFS_CORS_PATCH_SHA256:?Set RUSTFS_CORS_PATCH_SHA256 in rustfs/.env}
+        RUSTFS_CONSOLE_VERSION: ${RUSTFS_CONSOLE_VERSION:?Set RUSTFS_CONSOLE_VERSION in rustfs/.env}
+        RUSTFS_CONSOLE_SOURCE_COMMIT: ${RUSTFS_CONSOLE_SOURCE_COMMIT:?Set RUSTFS_CONSOLE_SOURCE_COMMIT in rustfs/.env}
+        RUSTFS_CONSOLE_SCOPED_PATCH_SHA256: ${RUSTFS_CONSOLE_SCOPED_PATCH_SHA256:?Set RUSTFS_CONSOLE_SCOPED_PATCH_SHA256 in rustfs/.env}
+        PROTOC_URL: ${PROTOC_URL:?Set PROTOC_URL in rustfs/.env}
+        PROTOC_SHA256: ${PROTOC_SHA256:?Set PROTOC_SHA256 in rustfs/.env}
+        FLATC_URL: ${FLATC_URL:?Set FLATC_URL in rustfs/.env}
+        FLATC_SHA256: ${FLATC_SHA256:?Set FLATC_SHA256 in rustfs/.env}
+        RUSTFS_BUILD_JOBS: ${RUSTFS_BUILD_JOBS:?Set RUSTFS_BUILD_JOBS in rustfs/.env}
