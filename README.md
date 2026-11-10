@@ -83,6 +83,12 @@ optional read; it must not restart the permission-loading cycle.
 The Rust builder requires the complete `rustfs-policy` library test suite and the
 `rustfs` library's `server::` tests to pass before compiling the release server.
 The latter cover the HTTP, CORS and shared virtual-host bucket-resolution code.
+The cached HTTP metric-label test runs alone in a fresh test process, followed by
+the remaining server tests in a second process. Its process-global `LazyLock`
+handles must first initialize under its local debugging recorder; other HTTP
+tests can otherwise bind them to a different recorder before that test runs.
+The isolated test remains mandatory, rather than being ignored or removed from
+coverage. This changes test scheduling only, not the upstream Rust source.
 It retains the normal musl release target and default feature
 set, checks that the binary needs no dynamic ELF interpreter, and runs its version
 command in the final image. The official runtime's entrypoint, user, environment,
@@ -116,11 +122,20 @@ requests require separate owner-run acceptance before replacing the running serv
 Building this image does not activate the `s3-users` policy.
 
 For `1.0.4-jwtfix.6`, only offline patch applicability and recipe consistency are
-checked at preparation time. The image build, Rust tests and live CORS/LiveSync
-acceptance have not been run. After an owner-run build and deployment, verify
-allowed and denied origins for both bucket-host `/` and object paths, GET and PUT
-preflights, and actual signed responses. Test public ingress explicitly when DNS
-differs between LAN and external clients.
+checked at preparation time. The first owner-run build passed 375 server tests
+but failed the cached metric-label test because of recorder isolation. The revised
+test sequence was not run by the assistant. On 2026-11-05 the owner verified
+public IPv4/IPv6 preflights, signed bucket/object reads over HTTP/1.1 and HTTP/2,
+and a real desktop LiveSync connection test through the public edge. The desktop
+capture used a temporary process-only DNS mapping; a subsequent Android
+connection test passed on mobile data after a normal app restart, without that
+override or changes to LiveSync settings.
+
+Do not retain the capture launcher as a workaround. These results do not replace
+denied-origin, PUT-preflight, full synchronization or other acceptance checks.
+The specific client state behind the earlier residual fetch failures was not
+identified. Test public ingress explicitly when DNS differs between LAN and
+external clients.
 
 When replacing these backports with upstream releases, review the source, compiler,
 runtime, console and code-generator pins together. Update the corresponding patch
